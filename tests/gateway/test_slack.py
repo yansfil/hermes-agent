@@ -1305,6 +1305,26 @@ class TestSendTyping:
         assert "C123" not in adapter._active_status_threads
 
     @pytest.mark.asyncio
+    async def test_stop_typing_clears_every_active_thread_in_channel(self, adapter):
+        """A completion must not leave an older concurrent thread thinking."""
+        adapter._app.client.assistant_threads_setStatus = AsyncMock()
+        await adapter.send_typing("C123", metadata={"thread_id": "thread-a"})
+        await adapter.send_typing("C123", metadata={"thread_id": "thread-b"})
+
+        await adapter.stop_typing("C123")
+
+        clear_calls = [
+            recorded
+            for recorded in adapter._app.client.assistant_threads_setStatus.call_args_list
+            if recorded.kwargs["status"] == ""
+        ]
+        assert clear_calls == [
+            call(channel_id="C123", thread_ts="thread-a", status=""),
+            call(channel_id="C123", thread_ts="thread-b", status=""),
+        ]
+        assert "C123" not in adapter._active_status_threads
+
+    @pytest.mark.asyncio
     async def test_stop_typing_noop_without_tracked_thread(self, adapter):
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
 
@@ -1314,7 +1334,7 @@ class TestSendTyping:
 
     @pytest.mark.asyncio
     async def test_stop_typing_handles_api_error_gracefully(self, adapter):
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads["C123"] = {"parent_ts"}
         adapter._app.client.assistant_threads_setStatus = AsyncMock(
             side_effect=Exception("missing_scope")
         )
@@ -1332,7 +1352,7 @@ class TestSendTyping:
     async def test_send_clears_status_after_final_post(self, adapter):
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply_ts"})
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads["C123"] = {"parent_ts"}
 
         result = await adapter.send("C123", "done", metadata={"thread_id": "parent_ts"})
 
@@ -1349,7 +1369,7 @@ class TestSendTyping:
     async def test_streaming_final_edit_clears_status(self, adapter):
         adapter._app.client.chat_update = AsyncMock()
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads["C123"] = {"parent_ts"}
 
         result = await adapter.edit_message(
             "C123",
@@ -1375,7 +1395,7 @@ class TestSendTyping:
     async def test_streaming_intermediate_edit_keeps_status(self, adapter):
         adapter._app.client.chat_update = AsyncMock()
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads["C123"] = {"parent_ts"}
 
         result = await adapter.edit_message(
             "C123",
@@ -1386,7 +1406,7 @@ class TestSendTyping:
 
         assert result.success
         adapter._app.client.assistant_threads_setStatus.assert_not_called()
-        assert adapter._active_status_threads["C123"] == "parent_ts"
+        assert adapter._active_status_threads["C123"] == {"parent_ts"}
 
 
 # ---------------------------------------------------------------------------
