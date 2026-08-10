@@ -1384,6 +1384,35 @@ class TestSendTyping:
         assert "C123" not in adapter._active_status_threads
 
     @pytest.mark.asyncio
+    async def test_stop_typing_waits_for_inflight_status_set_before_clearing(self, adapter):
+        """A late thinking request must never overwrite the final clear."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def set_status(**kwargs):
+            calls.append(kwargs)
+            if kwargs["status"] == "is thinking...":
+                started.set()
+                await release.wait()
+
+        adapter._app.client.assistant_threads_setStatus = AsyncMock(side_effect=set_status)
+        typing_task = asyncio.create_task(
+            adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        )
+        await started.wait()
+        clear_task = asyncio.create_task(adapter.stop_typing("C123"))
+        await asyncio.sleep(0.01)
+        # The clear must be waiting on the in-flight setStatus call, rather
+        # than racing it and allowing the late "thinking" write to win.
+        assert [call["status"] for call in calls] == ["is thinking..."]
+        release.set()
+        await asyncio.gather(typing_task, clear_task)
+
+        assert [call["status"] for call in calls] == ["is thinking...", ""]
+        assert "C123" not in adapter._active_status_threads
+
+    @pytest.mark.asyncio
     async def test_stop_typing_noop_without_tracked_thread(self, adapter):
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
 

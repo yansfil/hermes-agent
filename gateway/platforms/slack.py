@@ -366,6 +366,9 @@ class SlackAdapter(BasePlatformAdapter):
         # Track every active status in a channel so concurrent thread runs do
         # not overwrite one another and leak an older "is thinking..." status.
         self._active_status_threads: Dict[str, set[str]] = {}
+        # Serialize Slack Assistant API status writes per thread.  A delayed
+        # "is thinking" request must never land after a completion clear.
+        self._status_thread_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
         # Slash-command contexts: stash response_url + user_id so send()
         # can route the first reply ephemerally.  Keyed by
         # (channel_id, user_id) to avoid cross-user collisions.
@@ -946,15 +949,28 @@ class SlackAdapter(BasePlatformAdapter):
 
         self._active_status_threads.setdefault(chat_id, set()).add(thread_ts)
         try:
-            await self._get_client(chat_id).assistant_threads_setStatus(
-                channel_id=chat_id,
-                thread_ts=thread_ts,
-                status="is thinking...",
-            )
+            async with self._status_thread_lock(chat_id, thread_ts):
+                # A completion can clear the thread while this refresh waits
+                # for its turn.  Do not resurrect its status afterward.
+                if thread_ts not in self._active_status_threads.get(chat_id, set()):
+                    return
+                await self._get_client(chat_id).assistant_threads_setStatus(
+                    channel_id=chat_id,
+                    thread_ts=thread_ts,
+                    status="is thinking...",
+                )
         except Exception as e:
             # Silently ignore — may lack assistant:write scope or not be
             # in an assistant-enabled context. Falls back to reactions.
             logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
+
+    def _status_thread_lock(self, chat_id: str, thread_ts: str) -> asyncio.Lock:
+        """Return the lock that orders Assistant API writes for one thread."""
+        key = (chat_id, thread_ts)
+        lock = self._status_thread_locks.get(key)
+        if lock is None:
+            lock = self._status_thread_locks[key] = asyncio.Lock()
+        return lock
 
     async def stop_typing(self, chat_id: str, metadata=None) -> None:
         """Clear every active assistant thread status for a channel.
@@ -968,11 +984,17 @@ class SlackAdapter(BasePlatformAdapter):
         thread_tss = set(self._active_status_threads.get(chat_id, set()))
         for thread_ts in sorted(thread_tss):
             try:
-                await self._get_client(chat_id).assistant_threads_setStatus(
-                    channel_id=chat_id,
-                    thread_ts=thread_ts,
-                    status="",
-                )
+                # send_typing may already be in a slow Assistant API call.
+                # Serialize the clear behind it so the final clear is always
+                # the last status write Slack observes.
+                async with self._status_thread_lock(chat_id, thread_ts):
+                    if thread_ts not in self._active_status_threads.get(chat_id, set()):
+                        continue
+                    await self._get_client(chat_id).assistant_threads_setStatus(
+                        channel_id=chat_id,
+                        thread_ts=thread_ts,
+                        status="",
+                    )
             except Exception as e:
                 logger.warning(
                     "[Slack] assistant.threads.setStatus clear failed "
