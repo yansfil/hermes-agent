@@ -16,7 +16,10 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, Optional, Any, Tuple, List
+
+from agent.semantic_router import ThreadMessage, RoutingDecision, classify_thread_message
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -34,7 +37,7 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import Platform, PlatformConfig, _normalize_semantic_thread_routing
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -51,6 +54,18 @@ from gateway.platforms.base import (
 
 
 logger = logging.getLogger(__name__)
+
+_ROUTER_SECRET_RE = re.compile(
+    r"(?i)\b(authorization|token|api[_-]?key|secret|password)\b\s*[:=]\s*\S+|\bBearer\s+\S+"
+)
+
+
+def _safe_router_error(error: BaseException) -> str:
+    """Keep failure diagnostics useful without leaking credentials into logs."""
+    message = " ".join(str(error).split())
+    message = _ROUTER_SECRET_RE.sub("[REDACTED]", message)
+    return message[:240] or "(no detail)"
+
 
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
@@ -70,6 +85,12 @@ class _ThreadContextCache:
     fetched_at: float = field(default_factory=time.monotonic)
     message_count: int = 0
     parent_text: str = ""  # Raw text of the thread parent (for reply_to_text injection)
+
+
+class _DeterministicThreadRoute(Enum):
+    RESPOND = "respond"
+    IGNORE = "ignore"
+    AMBIGUOUS = "ambiguous"
 
 
 def check_slack_requirements() -> bool:
@@ -310,6 +331,8 @@ class SlackAdapter(BasePlatformAdapter):
         self._handler: Optional[Any] = None
         self._bot_user_id: Optional[str] = None
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
+        self._channel_info_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._CHANNEL_INFO_CACHE_TTL = 300.0
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}   # team_id → WebClient
@@ -348,6 +371,11 @@ class SlackAdapter(BasePlatformAdapter):
         # (channel_id, user_id) to avoid cross-user collisions.
         # Each value: {"response_url": str, "ts": float}
         self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Testable injection seam; production uses the Slack-independent classifier.
+        self._semantic_thread_router = classify_thread_message
+        # Bound only expensive LLM classification; deterministic routing and
+        # Slack context retrieval remain fully concurrent.
+        self._semantic_router_semaphore = asyncio.Semaphore(4)
 
     def _describe_slack_api_error(self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Convert Slack API auth/permission failures into actionable user-facing text."""
@@ -937,7 +965,7 @@ class SlackAdapter(BasePlatformAdapter):
         """
         if not self._app:
             return
-        thread_tss = self._active_status_threads.pop(chat_id, set())
+        thread_tss = set(self._active_status_threads.get(chat_id, set()))
         for thread_ts in sorted(thread_tss):
             try:
                 await self._get_client(chat_id).assistant_threads_setStatus(
@@ -946,7 +974,21 @@ class SlackAdapter(BasePlatformAdapter):
                     status="",
                 )
             except Exception as e:
-                logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
+                logger.warning(
+                    "[Slack] assistant.threads.setStatus clear failed "
+                    "channel=%s thread_ts=%s: %s",
+                    chat_id,
+                    thread_ts,
+                    e,
+                )
+                continue
+
+            active_threads = self._active_status_threads.get(chat_id)
+            if active_threads is None:
+                continue
+            active_threads.discard(thread_ts)
+            if not active_threads:
+                self._active_status_threads.pop(chat_id, None)
 
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Whether top-level Slack DMs get per-message session threads.
@@ -1615,19 +1657,46 @@ class SlackAdapter(BasePlatformAdapter):
                 text = f"{caption}\n{text}"
             return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
+    def _format_channel_topic_context(self, channel: Dict[str, Any]) -> Optional[str]:
+        """Build concise context from Slack channel topic and purpose fields."""
+        def _value(field_name: str) -> str:
+            raw = channel.get(field_name) or {}
+            if isinstance(raw, dict):
+                value = raw.get("value") or ""
+            else:
+                value = raw or ""
+            return str(value).strip()
+
+        topic = _value("topic")
+        purpose = _value("purpose")
+        parts: List[str] = []
+        if topic:
+            parts.append(f"Topic: {topic}")
+        if purpose and purpose != topic:
+            parts.append(f"Purpose: {purpose}")
+        return "\n".join(parts) if parts else None
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Slack channel."""
         if not self._app:
             return {"name": chat_id, "type": "unknown"}
 
+        cached = self._channel_info_cache.get(chat_id)
+        now = time.monotonic()
+        if cached and now - cached[0] < self._CHANNEL_INFO_CACHE_TTL:
+            return dict(cached[1])
+
         try:
             result = await self._get_client(chat_id).conversations_info(channel=chat_id)
             channel = result.get("channel", {})
             is_dm = channel.get("is_im", False)
-            return {
+            info = {
                 "name": channel.get("name", chat_id),
                 "type": "dm" if is_dm else "group",
+                "topic": self._format_channel_topic_context(channel),
             }
+            self._channel_info_cache[chat_id] = (now, dict(info))
+            return info
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[Slack] Failed to fetch chat info for %s: %s",
@@ -1956,13 +2025,15 @@ class SlackAdapter(BasePlatformAdapter):
         # In channels, respond if:
         #   0. Channel is in free_response_channels, OR require_mention is
         #      disabled — always process regardless of mention.
-        #   1. The bot is @mentioned in this message, OR
+        #   1. The bot is @mentioned or addressed by a configured wake word, OR
         #   2. The message is a reply in a thread the bot started/participated in, OR
         #   3. The message is in a thread where the bot was previously @mentioned, OR
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         routing_text = original_text or ""
-        is_mentioned = bot_uid and f"<@{bot_uid}>" in routing_text
+        is_direct_mention = bool(bot_uid and f"<@{bot_uid}>" in routing_text)
+        matched_wake_word = self._slack_matching_wake_word(routing_text)
+        is_mentioned = is_direct_mention or bool(matched_wake_word)
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
@@ -1984,7 +2055,7 @@ class SlackAdapter(BasePlatformAdapter):
                     is_thread_reply and event_thread_ts in self._bot_message_ts
                 )
                 in_mentioned_thread = (
-                    event_thread_ts is not None
+                    is_thread_reply
                     and event_thread_ts in self._mentioned_threads
                 )
                 has_session = (
@@ -1995,12 +2066,79 @@ class SlackAdapter(BasePlatformAdapter):
                         user_id=user_id,
                     )
                 )
-                if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
+                thread_is_in_scope = reply_to_bot_thread or in_mentioned_thread or has_session
+                if not thread_is_in_scope:
                     return
+                if self._slack_has_ignore_prefix(routing_text):
+                    return
+                semantic = self._slack_semantic_thread_routing()
+                if not semantic["enabled"]:
+                    deterministic_route = self._slack_deterministic_thread_route(
+                        routing_text, bot_uid
+                    )
+                    if deterministic_route != _DeterministicThreadRoute.RESPOND:
+                        return
+                else:
+                    context = await self._fetch_semantic_thread_context(
+                        channel_id, event_thread_ts, ts, team_id, semantic["context_messages"]
+                    )
+                    started_at = time.monotonic()
+                    try:
+                        # The deadline covers queueing behind the concurrency guard as
+                        # well as the provider call. Otherwise a saturated guard can
+                        # hold a Slack event indefinitely before any model work starts.
+                        async with asyncio.timeout(semantic["timeout_seconds"]):
+                            async with self._semantic_llm_guard():
+                                decision = await self._semantic_thread_router(
+                                    current_message=ThreadMessage(author="current", is_bot=False, text=routing_text[:1000]),
+                                    recent_messages=context,
+                                    bot_name="Modak",
+                                    provider=semantic["provider"], model=semantic["model"],
+                                    timeout_seconds=semantic["timeout_seconds"],
+                                )
+                    except asyncio.CancelledError:
+                        raise
+                    except asyncio.TimeoutError as error:
+                        latency_ms = (time.monotonic() - started_at) * 1000
+                        logger.warning(
+                            "[Slack] semantic thread router failed thread_ts=%s provider=%s model=%s "
+                            "timeout_seconds=%s context_messages=%d latency_ms=%.1f "
+                            "error_type=%s error=%s",
+                            event_thread_ts, semantic["provider"], semantic["model"],
+                            semantic["timeout_seconds"], len(context), latency_ms,
+                            type(error).__name__, "deadline exceeded",
+                        )
+                        decision = RoutingDecision("uncertain", 0.0, "router timeout")
+                    except Exception as error:
+                        latency_ms = (time.monotonic() - started_at) * 1000
+                        logger.warning(
+                            "[Slack] semantic thread router failed thread_ts=%s provider=%s model=%s "
+                            "timeout_seconds=%s context_messages=%d latency_ms=%.1f "
+                            "error_type=%s error=%s",
+                            event_thread_ts, semantic["provider"], semantic["model"],
+                            semantic["timeout_seconds"], len(context), latency_ms,
+                            type(error).__name__, _safe_router_error(error),
+                        )
+                        decision = RoutingDecision("uncertain", 0.0, "router failure")
+                    latency_ms = (time.monotonic() - started_at) * 1000
+                    bounded_reason = str(getattr(decision, "reason", "invalid"))[:20]
+                    logger.info(
+                        "[Slack] semantic thread route thread_ts=%s mode=%s provider=%s model=%s "
+                        "context_messages=%d latency_ms=%.1f decision=%s confidence=%s reason=%s",
+                        event_thread_ts, semantic["mode"], semantic["provider"], semantic["model"],
+                        len(context), latency_ms, getattr(decision, "decision", "invalid"),
+                        getattr(decision, "confidence", 0.0), bounded_reason,
+                    )
+                    if semantic["mode"] != "enforce" or not isinstance(decision, RoutingDecision) or decision.decision != "respond" or decision.confidence < semantic["confidence_threshold"]:
+                        return
 
         if is_mentioned:
-            # Strip the bot mention from the text
-            text = text.replace(f"<@{bot_uid}>", "").strip()
+            # Strip the bot mention / wake word from the text so the agent
+            # receives the user's request rather than the routing prefix.
+            if is_direct_mention:
+                text = text.replace(f"<@{bot_uid}>", "").strip()
+            elif matched_wake_word:
+                text = self._slack_strip_wake_word(text, matched_wake_word)
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
@@ -2183,14 +2321,23 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve user display name (cached after first lookup)
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
 
+        # Resolve channel display name and topic/purpose context. Slack's
+        # conversations.info topic/purpose are workspace-owned channel context,
+        # so pass them through SessionSource.chat_topic for gateway prompt
+        # injection instead of requiring users to repeat the context each turn.
+        chat_info = await self.get_chat_info(channel_id) if channel_id else {}
+        chat_name = str(chat_info.get("name") or channel_id)
+        chat_topic = chat_info.get("topic")
+
         # Build source
         source = self.build_source(
             chat_id=channel_id,
-            chat_name=channel_id,  # Will be resolved later if needed
+            chat_name=chat_name,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            chat_topic=str(chat_topic) if chat_topic else None,
         )
 
         # Per-channel ephemeral prompt
@@ -2810,10 +2957,15 @@ class SlackAdapter(BasePlatformAdapter):
         # keep group semantics so different users do not collide into one
         # session key.
         is_dm = str(channel_id).startswith("D")
+        chat_info = await self.get_chat_info(channel_id) if channel_id else {}
+        chat_name = str(chat_info.get("name") or channel_id)
+        chat_topic = chat_info.get("topic")
         source = self.build_source(
             chat_id=channel_id,
+            chat_name=chat_name,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
+            chat_topic=str(chat_topic) if chat_topic else None,
         )
 
         event = MessageEvent(
@@ -3013,6 +3165,208 @@ class SlackAdapter(BasePlatformAdapter):
         if s:
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
+
+    def _slack_wake_words(self) -> list[str]:
+        """Return configured Slack wake words.
+
+        Wake words are address prefixes such as ``모닥아``. They are treated
+        like @mentions for channel gating, but only when they start the
+        message after leading whitespace. This avoids triggering on casual
+        third-person references in the middle of a sentence.
+        """
+        raw = self.config.extra.get("wake_words")
+        if raw is None:
+            raw = os.getenv("SLACK_WAKE_WORDS", "")
+        if isinstance(raw, list):
+            return [str(part).strip() for part in raw if str(part).strip()]
+        s = str(raw).strip() if raw is not None else ""
+        if not s:
+            return []
+        return [part.strip() for part in s.split(",") if part.strip()]
+
+    def _slack_matching_wake_word(self, text: str) -> Optional[str]:
+        """Return the wake word that addresses the bot, if any."""
+        stripped = (text or "").lstrip()
+        for wake_word in self._slack_wake_words():
+            if not stripped.startswith(wake_word):
+                continue
+            remainder = stripped[len(wake_word):]
+            if not remainder:
+                return wake_word
+            # Allow natural address punctuation/spacing after the wake word:
+            # "모닥아", "모닥아?", "모닥아 해줘". Do not match
+            # "모닥아라는" or "modakbul" for a wake word "modak".
+            if re.match(r"^[\s\.,:;!?~，。！？、]+", remainder):
+                return wake_word
+        return None
+
+    def _slack_strip_wake_word(self, text: str, wake_word: str) -> str:
+        """Remove a leading wake word and adjacent address punctuation."""
+        if not wake_word:
+            return (text or "").strip()
+        return re.sub(
+            rf"^\s*{re.escape(wake_word)}[\s\.,:;!?~，。！？、]*",
+            "",
+            text or "",
+            count=1,
+        ).strip()
+
+    def _slack_ignore_prefixes(self) -> list[str]:
+        """Return prefixes that force Slack thread auto-replies to stay silent."""
+        raw = self.config.extra.get("ignore_prefixes")
+        if raw is None:
+            raw = os.getenv("SLACK_IGNORE_PREFIXES", "xx,//,모닥무시,ignore:,무시:")
+        if isinstance(raw, list):
+            return [str(part).strip() for part in raw if str(part).strip()]
+        s = str(raw).strip() if raw is not None else ""
+        if not s:
+            return []
+        return [part.strip() for part in s.split(",") if part.strip()]
+
+    def _slack_smart_thread_replies(self) -> bool:
+        """Return whether participated Slack threads use intent gating."""
+        configured = self.config.extra.get("smart_thread_replies")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() not in {"false", "0", "no", "off"}
+            return bool(configured)
+        return os.getenv("SLACK_SMART_THREAD_REPLIES", "true").lower() not in {"false", "0", "no", "off"}
+
+    def _slack_has_ignore_prefix(self, text: str) -> bool:
+        """Return true when text starts with a configured ignore prefix."""
+        stripped = (text or "").lstrip()
+        lowered = stripped.lower()
+        for prefix in self._slack_ignore_prefixes():
+            prefix_l = prefix.lower()
+            if not lowered.startswith(prefix_l):
+                continue
+            remainder = stripped[len(prefix):]
+            if not remainder:
+                return True
+            if re.match(r"^[\s\.,:;!?~，。！？、]+", remainder):
+                return True
+        return False
+
+    def _slack_should_auto_respond_in_thread(self, text: str, bot_uid: Optional[str]) -> bool:
+        """Decide whether a non-mentioned Slack thread reply is addressed to the bot.
+
+        This only applies after a thread is already in scope because the bot
+        participated in it. Explicit mentions and wake words are handled before
+        this helper. The rule is deliberately conservative: if ambiguous, stay
+        silent and let the user mention the bot again.
+        """
+        if self._slack_has_ignore_prefix(text):
+            return False
+        if not self._slack_smart_thread_replies():
+            return True
+
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        if bot_uid and f"<@{bot_uid}>" in stripped:
+            return True
+        lowered = stripped.lower()
+
+        # Bot names should only wake the agent when used as a direct address.
+        # Third-person references like "모닥이에게 시켜볼까요?" are human-to-human
+        # coordination and should stay silent.
+        third_person_bot_reference = re.search(
+            r"모닥(?:이)?(?:에게|한테|보고|을|를|이가|이는|도|랑|의|한테다가)",
+            stripped,
+        )
+        direct_bot_address_patterns = (
+            r"(^|[\s\.,:;!?~，。！？、])(?:야\s+)?모닥(?:이)?(?:아|야|놈아)(?=$|[\s\.,:;!?~，。！？、])",
+            r"^(?:야\s+)?모닥(?:이)?\s*[,،:：!?~]",
+            r"^(?:modak|hermes|bot)\s*[,،:：!?~]",
+        )
+        if not third_person_bot_reference and any(
+            re.search(pattern, stripped, re.IGNORECASE) for pattern in direct_bot_address_patterns
+        ):
+            return True
+        if any(wake_word and wake_word.lower() in lowered for wake_word in self._slack_wake_words()):
+            return True
+
+        # Human-directed questions should stay silent even if they contain words
+        # like "생각" or "어떻게".
+        if re.search(r"\b[\w가-힣]+님\b", stripped):
+            return False
+
+        request_patterns = (
+            r"(정리|요약|설명|검토|확인|분석|비교|추천|작성|초안|수정|고쳐|만들|실행|처리).*(해줘|해주세요|줘|주세요|해볼래|해봐)",
+            r"(다시|좀 더|조금 더|방금|위 내용|이 내용|이거).*(정리|요약|설명|검토|확인|분석|작성|수정)",
+            r"(근거|이유|원인|의견|생각).*(뭐|무엇|어때|어떻게|알려|말해)",
+            r"^(너|니가|네가|너는|넌).*(왜|어때|어떻게|생각|대답|가능|맞아|해줘|해주세요|줘|주세요|\?)",
+            r"^(왜|근거는|이유는|다시 봐|다시봐|좀 더|더 자세히|짧게|간단히)\b",
+        )
+        if any(re.search(pattern, stripped) for pattern in request_patterns):
+            return True
+
+        return False
+
+    def _slack_semantic_thread_routing(self) -> Dict[str, Any]:
+        """Use the central semantic-routing config normalizer at runtime too."""
+        return _normalize_semantic_thread_routing(
+            self.config.extra.get("semantic_thread_routing")
+        )
+
+    def _semantic_llm_guard(self) -> asyncio.Semaphore:
+        """Return the bounded classifier guard, supporting lightweight test adapters."""
+        semaphore = getattr(self, "_semantic_router_semaphore", None)
+        if semaphore is None:
+            semaphore = self._semantic_router_semaphore = asyncio.Semaphore(4)
+        return semaphore
+
+    def _slack_deterministic_thread_route(self, text: str, bot_uid: Optional[str]) -> _DeterministicThreadRoute:
+        """Classify only locally certain thread messages; leave the rest ambiguous."""
+        stripped = (text or "").strip()
+        if not stripped or self._slack_has_ignore_prefix(stripped):
+            return _DeterministicThreadRoute.IGNORE
+        if re.search(r"모닥(?:이)?(?:에게|한테|보고|을|를|이가|이는|도|랑|의|한테다가)", stripped):
+            return _DeterministicThreadRoute.IGNORE
+        if re.search(r"\b[\w가-힣]+님\b", stripped):
+            return _DeterministicThreadRoute.IGNORE
+        if self._slack_should_auto_respond_in_thread(stripped, bot_uid):
+            return _DeterministicThreadRoute.RESPOND
+        return _DeterministicThreadRoute.AMBIGUOUS
+
+    async def _fetch_semantic_thread_context(self, channel_id: str, thread_ts: str, current_ts: str, team_id: str, limit: int) -> Tuple[ThreadMessage, ...]:
+        """Fetch only minimal current-thread text for semantic classification."""
+        try:
+            response = await self._get_client(channel_id).conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                latest=current_ts,
+                inclusive=False,
+                limit=limit + 1,
+            )
+            messages = response.get("messages", []) if hasattr(response, "get") else []
+            records = []
+            seen_timestamps = set()
+            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                message_ts = str(message.get("ts", ""))
+                if not message_ts or message_ts == str(current_ts) or message_ts in seen_timestamps:
+                    continue
+                seen_timestamps.add(message_ts)
+                text = message.get("text")
+                if not isinstance(text, str):
+                    continue
+                user_id = str(message.get("user") or message.get("bot_id") or "")
+                is_bot = bool((bot_uid and user_id == bot_uid) or message.get("bot_id") or message.get("subtype") == "bot_message")
+                author = await self._resolve_user_name(user_id, chat_id=channel_id) if user_id else ("bot" if is_bot else "unknown")
+                records.append(ThreadMessage(author=author or ("bot" if is_bot else "unknown"), is_bot=is_bot, text=text[:1000]))
+            return tuple(records[-limit:])
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "[Slack] semantic thread context fetch failed channel=%s thread_ts=%s "
+                "limit=%s error_type=%s error=%s",
+                channel_id, thread_ts, limit, type(error).__name__, _safe_router_error(error),
+            )
+            return ()
 
     def _slack_allowed_channels(self) -> set:
         """Return the whitelist of channel IDs the bot will respond in.

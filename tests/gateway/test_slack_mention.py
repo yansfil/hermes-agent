@@ -7,6 +7,8 @@ Follows the same pattern as test_whatsapp_group_gating.py.
 import sys
 from unittest.mock import MagicMock
 
+import pytest
+
 from gateway.config import Platform, PlatformConfig
 
 
@@ -55,7 +57,15 @@ CHANNEL_ID = "C0AQWDLHY9M"
 OTHER_CHANNEL_ID = "C9999999999"
 
 
-def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None, allowed_channels=None):
+def _make_adapter(
+    require_mention=None,
+    strict_mention=None,
+    free_response_channels=None,
+    allowed_channels=None,
+    wake_words=None,
+    ignore_prefixes=None,
+    smart_thread_replies=None,
+):
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
@@ -65,6 +75,12 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
         extra["free_response_channels"] = free_response_channels
     if allowed_channels is not None:
         extra["allowed_channels"] = allowed_channels
+    if wake_words is not None:
+        extra["wake_words"] = wake_words
+    if ignore_prefixes is not None:
+        extra["ignore_prefixes"] = ignore_prefixes
+    if smart_thread_replies is not None:
+        extra["smart_thread_replies"] = smart_thread_replies
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -235,6 +251,52 @@ def test_free_response_channels_int_list():
 
 
 # ---------------------------------------------------------------------------
+# Tests: _slack_wake_words and wake-word matching
+# ---------------------------------------------------------------------------
+
+def test_wake_words_default_empty(monkeypatch):
+    monkeypatch.delenv("SLACK_WAKE_WORDS", raising=False)
+    adapter = _make_adapter()
+    assert adapter._slack_wake_words() == []
+
+
+def test_wake_words_list():
+    adapter = _make_adapter(wake_words=["모닥아", "modak"])
+    assert adapter._slack_wake_words() == ["모닥아", "modak"]
+
+
+def test_wake_words_csv_string():
+    adapter = _make_adapter(wake_words="모닥아, modak")
+    assert adapter._slack_wake_words() == ["모닥아", "modak"]
+
+
+def test_wake_words_env_var_fallback(monkeypatch):
+    monkeypatch.setenv("SLACK_WAKE_WORDS", "모닥아,modak")
+    adapter = _make_adapter()
+    assert adapter._slack_wake_words() == ["모닥아", "modak"]
+
+
+def test_wake_word_matches_leading_address():
+    adapter = _make_adapter(wake_words=["모닥아"])
+    assert adapter._slack_matching_wake_word("모닥아 일정 확인해줘") == "모닥아"
+    assert adapter._slack_matching_wake_word("  모닥아? 일정 확인해줘") == "모닥아"
+    assert adapter._slack_matching_wake_word("모닥아") == "모닥아"
+
+
+def test_wake_word_does_not_match_mid_sentence_or_prefix_only():
+    adapter = _make_adapter(wake_words=["모닥아", "modak"])
+    assert adapter._slack_matching_wake_word("오늘 모닥아 테스트") is None
+    assert adapter._slack_matching_wake_word("모닥아라는 이름") is None
+    assert adapter._slack_matching_wake_word("modakbul check") is None
+
+
+def test_strip_wake_word_removes_prefix_and_punctuation():
+    adapter = _make_adapter(wake_words=["모닥아"])
+    assert adapter._slack_strip_wake_word("모닥아 일정 확인해줘", "모닥아") == "일정 확인해줘"
+    assert adapter._slack_strip_wake_word("  모닥아? 일정 확인해줘", "모닥아") == "일정 확인해줘"
+
+
+# ---------------------------------------------------------------------------
 # Tests: mention gating integration (simulating _handle_slack_message logic)
 # ---------------------------------------------------------------------------
 
@@ -249,7 +311,8 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
     bot_uid = adapter._team_bot_user_ids.get("T1", adapter._bot_user_id)
     if mentioned:
         text = f"<@{bot_uid}> {text}"
-    is_mentioned = bot_uid and f"<@{bot_uid}>" in text
+    is_direct_mention = bool(bot_uid and f"<@{bot_uid}>" in text)
+    is_mentioned = is_direct_mention or bool(adapter._slack_matching_wake_word(text))
 
     if not is_dm and bot_uid:
         # allowed_channels check (whitelist — must pass before other gating)
@@ -263,7 +326,7 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
             return True
         elif not is_mentioned:
             if thread_reply and active_session:
-                return True
+                return adapter._slack_should_auto_respond_in_thread(text, bot_uid)
             else:
                 return False
     return True
@@ -305,10 +368,78 @@ def test_mentioned_message_always_processed():
     assert _would_process(adapter, mentioned=True, text="what's up") is True
 
 
-def test_thread_reply_with_active_session_processed():
+def test_wake_word_message_processed_like_mention():
+    adapter = _make_adapter(require_mention=True, wake_words=["모닥아"])
+    assert _would_process(adapter, text="모닥아 일정 확인해줘") is True
+
+
+def test_wake_word_message_respects_allowed_channels():
+    adapter = _make_adapter(allowed_channels=[CHANNEL_ID], wake_words=["모닥아"])
+    assert _would_process(adapter, channel_id=OTHER_CHANNEL_ID, text="모닥아 일정 확인해줘") is False
+
+
+def test_wake_word_mid_sentence_still_ignored():
+    adapter = _make_adapter(require_mention=True, wake_words=["모닥아"])
+    assert _would_process(adapter, text="오늘 모닥아 테스트") is False
+
+
+def test_ignore_prefixes_default_include_xx_and_slash_comment(monkeypatch):
+    monkeypatch.delenv("SLACK_IGNORE_PREFIXES", raising=False)
+    adapter = _make_adapter()
+    assert adapter._slack_ignore_prefixes()[:2] == ["xx", "//"]
+
+
+def test_ignore_prefix_blocks_thread_auto_response():
+    adapter = _make_adapter()
+    assert adapter._slack_should_auto_respond_in_thread("xx 우리끼리 얘기", "U_BOT") is False
+    assert adapter._slack_should_auto_respond_in_thread("// 우리끼리 얘기", "U_BOT") is False
+
+
+def test_thread_auto_response_when_message_directly_addresses_modak():
+    adapter = _make_adapter()
+    assert adapter._slack_should_auto_respond_in_thread("모닥아 이거 맞아?", "U_BOT") is True
+    assert adapter._slack_should_auto_respond_in_thread("모닥이야 이거 맞아?", "U_BOT") is True
+    assert adapter._slack_should_auto_respond_in_thread("모닥이놈아", "U_BOT") is True
+    assert adapter._slack_should_auto_respond_in_thread("야 모닥, 이거 봐줘", "U_BOT") is True
+
+
+def test_thread_auto_response_ignores_third_person_modak_references():
+    adapter = _make_adapter()
+    assert adapter._slack_should_auto_respond_in_thread("모닥이에게 시켜볼까요?", "U_BOT") is False
+    assert adapter._slack_should_auto_respond_in_thread("모닥이한테 물어볼까요?", "U_BOT") is False
+    assert adapter._slack_should_auto_respond_in_thread("모닥이가 하면 될 듯", "U_BOT") is False
+    assert adapter._slack_should_auto_respond_in_thread("모닥이 말대로면 A가 맞나?", "U_BOT") is False
+
+
+def test_thread_auto_response_for_contextual_you_question():
+    adapter = _make_adapter()
+    assert adapter._slack_should_auto_respond_in_thread("너 왜 대답 안하냐?", "U_BOT") is True
+    assert adapter._slack_should_auto_respond_in_thread("너는 어떻게 생각해?", "U_BOT") is True
+
+
+def test_thread_auto_response_for_direct_followup_request():
+    adapter = _make_adapter()
+    assert adapter._slack_should_auto_respond_in_thread("방금 내용 정리해줘", "U_BOT") is True
+
+
+def test_thread_auto_response_ignores_human_to_human_discussion():
+    adapter = _make_adapter()
+    assert adapter._slack_should_auto_respond_in_thread("카일님 이건 어떻게 생각하세요?", "U_BOT") is False
+    assert adapter._slack_should_auto_respond_in_thread("저는 B가 나아보여요", "U_BOT") is False
+
+
+def test_thread_reply_with_active_session_ignored_when_not_addressed_to_bot():
     adapter = _make_adapter(require_mention=True)
     assert _would_process(
         adapter, text="followup",
+        thread_reply=True, active_session=True,
+    ) is False
+
+
+def test_thread_reply_with_active_session_processed_when_addressed_to_bot():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="방금 내용 정리해줘",
         thread_reply=True, active_session=True,
     ) is True
 
@@ -360,13 +491,17 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
         "  require_mention: false\n"
         "  free_response_channels:\n"
         "    - C0AQWDLHY9M\n"
-        "    - C9999999999\n",
+        "    - C9999999999\n"
+        "  wake_words:\n"
+        "    - 모닥아\n"
+        "    - modak\n",
         encoding="utf-8",
     )
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
     monkeypatch.delenv("SLACK_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("SLACK_WAKE_WORDS", raising=False)
 
     config = load_gateway_config()
 
@@ -374,10 +509,12 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     slack_extra = config.platforms[Platform.SLACK].extra
     assert slack_extra.get("require_mention") is False
     assert slack_extra.get("free_response_channels") == ["C0AQWDLHY9M", "C9999999999"]
+    assert slack_extra.get("wake_words") == ["모닥아", "modak"]
     # Verify env vars were set by config bridging
     import os as _os
     assert _os.environ["SLACK_REQUIRE_MENTION"] == "false"
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
+    assert _os.environ["SLACK_WAKE_WORDS"] == "모닥아,modak"
 
 
 def test_top_level_slack_settings_do_not_disable_env_token_setup(monkeypatch, tmp_path):
@@ -514,6 +651,62 @@ def test_config_bridges_slack_strict_mention(monkeypatch, tmp_path):
     assert config is not None
     import os as _os
     assert _os.environ["SLACK_STRICT_MENTION"] == "true"
+
+
+def test_config_bridges_slack_smart_thread_replies_and_ignore_prefixes(monkeypatch, tmp_path):
+    from gateway.config import load_gateway_config
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "slack:\n"
+        "  smart_thread_replies: true\n"
+        "  ignore_prefixes:\n"
+        "    - xx\n"
+        "    - //\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("SLACK_SMART_THREAD_REPLIES", raising=False)
+    monkeypatch.delenv("SLACK_IGNORE_PREFIXES", raising=False)
+
+    config = load_gateway_config()
+
+    assert config is not None
+    slack_extra = config.platforms[Platform.SLACK].extra
+    assert slack_extra.get("smart_thread_replies") is True
+    assert slack_extra.get("ignore_prefixes") == ["xx", "//"]
+    import os as _os
+    assert _os.environ["SLACK_SMART_THREAD_REPLIES"] == "true"
+    assert _os.environ["SLACK_IGNORE_PREFIXES"] == "xx,//"
+
+
+def test_config_bridges_semantic_thread_routing_without_stringifying_numbers(monkeypatch, tmp_path):
+    from gateway.config import load_gateway_config
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "slack:\n  semantic_thread_routing:\n    enabled: true\n    mode: enforce\n    context_messages: 99\n    confidence_threshold: 2\n    timeout_seconds: 4\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    routing = load_gateway_config().platforms[Platform.SLACK].extra["semantic_thread_routing"]
+    assert routing == {"enabled": True, "mode": "enforce", "provider": "openai-codex", "model": "gpt-5.4-mini", "context_messages": 12, "confidence_threshold": 1.0, "timeout_seconds": 4}
+
+
+@pytest.mark.parametrize("enabled, expected", [(False, False), ("false", False), ("off", False), ("true", True), ("yes", True), ("unknown", False), (1, False)])
+def test_semantic_thread_routing_enabled_is_strictly_normalized(enabled, expected):
+    from gateway.config import _normalize_semantic_thread_routing
+
+    assert _normalize_semantic_thread_routing({"enabled": enabled})["enabled"] is expected
+
+
+@pytest.mark.parametrize("timeout, expected", [(float("inf"), 3), (float("-inf"), 3), (float("nan"), 3), ("not-a-number", 3), (999, 15), (0, 0.1)])
+def test_semantic_thread_routing_timeout_is_finite_and_bounded(timeout, expected):
+    from gateway.config import _normalize_semantic_thread_routing
+
+    assert _normalize_semantic_thread_routing({"enabled": True, "timeout_seconds": timeout})["timeout_seconds"] == expected
 
 
 # ---------------------------------------------------------------------------

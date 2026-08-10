@@ -9,6 +9,7 @@ Handles loading and validating configuration for:
 """
 
 import logging
+import math
 import os
 import json
 from pathlib import Path
@@ -54,6 +55,47 @@ def _coerce_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _normalize_semantic_thread_routing(value: Any) -> Dict[str, Any]:
+    """Validate and normalize opt-in Slack semantic thread routing settings."""
+    result: Dict[str, Any] = {"enabled": False, "mode": "shadow", "provider": "openai-codex", "model": "gpt-5.4-mini", "context_messages": 8, "confidence_threshold": 0.85, "timeout_seconds": 3}
+    if not isinstance(value, dict):
+        return result
+
+    enabled = value.get("enabled", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in {"true", "1", "yes", "on"}
+    elif not isinstance(enabled, bool):
+        enabled = False
+    if not enabled:
+        return result
+
+    result.update(value)
+    result["enabled"] = True
+    if result.get("mode") not in {"off", "shadow", "enforce"}:
+        result["mode"] = "shadow"
+    try:
+        result["context_messages"] = max(3, min(12, int(result["context_messages"])))
+    except (TypeError, ValueError):
+        result["context_messages"] = 8
+    try:
+        result["confidence_threshold"] = max(0.0, min(1.0, float(result["confidence_threshold"])))
+    except (TypeError, ValueError):
+        result["confidence_threshold"] = 0.85
+    try:
+        timeout_seconds = float(result["timeout_seconds"])
+        result["timeout_seconds"] = max(0.1, min(15.0, timeout_seconds)) if math.isfinite(timeout_seconds) else 3
+    except (TypeError, ValueError):
+        result["timeout_seconds"] = 3
+    if not isinstance(result.get("provider"), str) or not result["provider"].strip() or not isinstance(result.get("model"), str) or not result["model"].strip():
+        result["enabled"] = False
+    else:
+        result["provider"] = result["provider"].strip()
+        result["model"] = result["model"].strip()
+    if result["mode"] == "off":
+        result["enabled"] = False
+    return result
 
 
 def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> str:
@@ -838,6 +880,16 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["allowed_topics"] = platform_cfg["allowed_topics"]
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
+                if plat == Platform.SLACK and "wake_words" in platform_cfg:
+                    bridged["wake_words"] = platform_cfg["wake_words"]
+                if plat == Platform.SLACK and "ignore_prefixes" in platform_cfg:
+                    bridged["ignore_prefixes"] = platform_cfg["ignore_prefixes"]
+                if plat == Platform.SLACK and "smart_thread_replies" in platform_cfg:
+                    bridged["smart_thread_replies"] = platform_cfg["smart_thread_replies"]
+                if plat == Platform.SLACK and "semantic_thread_routing" in platform_cfg:
+                    routing = platform_cfg["semantic_thread_routing"]
+                    if isinstance(routing, dict):
+                        bridged["semantic_thread_routing"] = _normalize_semantic_thread_routing(routing)
                 if "mention_patterns" in platform_cfg:
                     bridged["mention_patterns"] = platform_cfg["mention_patterns"]
                 if "exclusive_bot_mentions" in platform_cfg:
@@ -919,6 +971,18 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["SLACK_FREE_RESPONSE_CHANNELS"] = str(frc)
+                wake_words = slack_cfg.get("wake_words")
+                if wake_words is not None and not os.getenv("SLACK_WAKE_WORDS"):
+                    if isinstance(wake_words, list):
+                        wake_words = ",".join(str(v) for v in wake_words)
+                    os.environ["SLACK_WAKE_WORDS"] = str(wake_words)
+                ignore_prefixes = slack_cfg.get("ignore_prefixes")
+                if ignore_prefixes is not None and not os.getenv("SLACK_IGNORE_PREFIXES"):
+                    if isinstance(ignore_prefixes, list):
+                        ignore_prefixes = ",".join(str(v) for v in ignore_prefixes)
+                    os.environ["SLACK_IGNORE_PREFIXES"] = str(ignore_prefixes)
+                if "smart_thread_replies" in slack_cfg and not os.getenv("SLACK_SMART_THREAD_REPLIES"):
+                    os.environ["SLACK_SMART_THREAD_REPLIES"] = str(slack_cfg["smart_thread_replies"]).lower()
                 if "reactions" in slack_cfg and not os.getenv("SLACK_REACTIONS"):
                     os.environ["SLACK_REACTIONS"] = str(slack_cfg["reactions"]).lower()
                 # allowed_channels: if set, bot ONLY responds in these channels (whitelist)

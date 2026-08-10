@@ -9,6 +9,7 @@ We mock the slack modules at import time to avoid collection errors.
 """
 
 import asyncio
+import logging
 import os
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch, call
@@ -16,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from agent.semantic_router import RoutingDecision
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
@@ -130,6 +132,63 @@ class TestSlashCommandSessionIsolation:
         assert event.source.chat_type == "dm"
         assert event.source.chat_id == "D123"
         assert event.source.user_id == "U123"
+
+
+# ---------------------------------------------------------------------------
+# TestSlackChannelTopicContext
+# ---------------------------------------------------------------------------
+
+class TestSlackChannelTopicContext:
+    @pytest.mark.asyncio
+    async def test_get_chat_info_returns_topic_and_purpose_context(self, adapter):
+        adapter._app.client.conversations_info = AsyncMock(return_value={
+            "channel": {
+                "name": "marketing",
+                "is_im": False,
+                "topic": {"value": "모집 카드뉴스와 캠페인 논의"},
+                "purpose": {"value": "모닥불 마케팅 실행 채널"},
+            }
+        })
+
+        info = await adapter.get_chat_info("C_MARKETING")
+
+        assert info["name"] == "marketing"
+        assert info["type"] == "group"
+        assert info["topic"] == (
+            "Topic: 모집 카드뉴스와 캠페인 논의\n"
+            "Purpose: 모닥불 마케팅 실행 채널"
+        )
+
+    @pytest.mark.asyncio
+    async def test_incoming_channel_message_sets_source_chat_topic(self, adapter):
+        adapter._user_name_cache["U123"] = "그랩"
+        adapter._app.client.conversations_info = AsyncMock(return_value={
+            "channel": {
+                "name": "marketing",
+                "is_im": False,
+                "topic": {"value": "모집 카드뉴스와 캠페인 논의"},
+                "purpose": {"value": "모닥불 마케팅 실행 채널"},
+            }
+        })
+        event = {
+            "type": "message",
+            "channel": "C_MARKETING",
+            "channel_type": "channel",
+            "user": "U123",
+            "team": "T123",
+            "ts": "123.456",
+            "text": "<@U_BOT> 이 채널 맥락 알지?",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_awaited_once()
+        msg_event = adapter.handle_message.await_args.args[0]
+        assert msg_event.source.chat_name == "marketing"
+        assert msg_event.source.chat_topic == (
+            "Topic: 모집 카드뉴스와 캠페인 논의\n"
+            "Purpose: 모닥불 마케팅 실행 채널"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1333,19 +1392,27 @@ class TestSendTyping:
         adapter._app.client.assistant_threads_setStatus.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_stop_typing_handles_api_error_gracefully(self, adapter):
+    async def test_stop_typing_retries_status_after_transient_api_error(self, adapter):
         adapter._active_status_threads["C123"] = {"parent_ts"}
         adapter._app.client.assistant_threads_setStatus = AsyncMock(
-            side_effect=Exception("missing_scope")
+            side_effect=[Exception("ratelimited"), None]
         )
 
         await adapter.stop_typing("C123")
 
-        adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
+        assert adapter._active_status_threads["C123"] == {"parent_ts"}
+
+        await adapter.stop_typing("C123")
+
+        expected_clear = call(
             channel_id="C123",
             thread_ts="parent_ts",
             status="",
         )
+        assert adapter._app.client.assistant_threads_setStatus.call_args_list == [
+            expected_clear,
+            expected_clear,
+        ]
         assert "C123" not in adapter._active_status_threads
 
     @pytest.mark.asyncio
@@ -2044,16 +2111,16 @@ class TestThreadReplyHandling:
         adapter_with_session_store.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_thread_reply_without_mention_with_session_processed(
+    async def test_thread_reply_without_mention_with_session_processed_when_addressed_to_bot(
         self, adapter_with_session_store, mock_session_store
     ):
-        """Thread replies without mention should be processed if there's an active session."""
+        """Thread replies without mention are processed only when addressed to the bot."""
         # Simulate an active session for this thread
         session_key = "agent:main:slack:group:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
 
         event = {
-            "text": "Follow-up question",
+            "text": "방금 내용 정리해줘",
             "user": "U_USER",
             "channel": "C123",
             "ts": "123.456",
@@ -2066,7 +2133,289 @@ class TestThreadReplyHandling:
 
         # Verify the text is passed through unchanged (no mention stripping needed)
         msg_event = adapter_with_session_store.handle_message.call_args[0][0]
-        assert msg_event.text == "Follow-up question"
+        assert msg_event.text == "방금 내용 정리해줘"
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_without_mention_with_session_ignored_when_human_chatter(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Human-to-human chatter in participated threads should stay silent."""
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "저는 B가 나아보여요",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_semantic_thread_context_is_structured_and_excludes_current_event(self, adapter_with_session_store):
+        adapter_with_session_store._user_name_cache.update({"U1": "Alice", "U_BOT": "Modak"})
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(return_value={"messages": [
+            {"ts": "1", "user": "U1", "text": "old"},
+            {"ts": "2", "user": "U_BOT", "text": "bot reply"},
+            {"ts": "3", "user": "U1", "text": "x" * 1200},
+        ]})
+        context = await adapter_with_session_store._fetch_semantic_thread_context("C123", "1", "3", "T_TEAM", 8)
+        assert [(m.author, m.is_bot, len(m.text)) for m in context] == [("Alice", False, 3), ("Modak", True, 9)]
+
+    @pytest.mark.asyncio
+    async def test_semantic_thread_context_accepts_slack_sdk_mapping_response(self, adapter_with_session_store):
+        class SlackResponseLike:
+            def __init__(self, data):
+                self.data = data
+
+            def get(self, key, default=None):
+                return self.data.get(key, default)
+
+        adapter_with_session_store._user_name_cache.update({"U1": "Alice", "U_BOT": "Modak"})
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(
+            return_value=SlackResponseLike({"messages": [
+                {"ts": "1", "user": "U1", "text": "모닥아 테스트 시작하자"},
+                {"ts": "2", "user": "U_BOT", "bot_id": "B1", "text": "담당자를 제출하세요"},
+            ]})
+        )
+
+        context = await adapter_with_session_store._fetch_semantic_thread_context(
+            "C123", "1", "3", "T_TEAM", 8
+        )
+
+        assert [(m.author, m.is_bot, m.text) for m in context] == [
+            ("Alice", False, "모닥아 테스트 시작하자"),
+            ("Modak", True, "담당자를 제출하세요"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_semantic_thread_context_is_time_bounded_deduplicated_and_keeps_final_window(self, adapter_with_session_store):
+        adapter_with_session_store._user_name_cache.update({"U1": "Alice"})
+        client = adapter_with_session_store._app.client
+        client.conversations_replies = AsyncMock(return_value={"messages": [
+            {"ts": "1", "user": "U1", "text": "root"},
+            {"ts": "2", "user": "U1", "text": "old"},
+            {"ts": "3", "user": "U1", "text": "duplicate first"},
+            {"ts": "3", "user": "U1", "text": "duplicate second"},
+            {"ts": "4", "user": "U1", "text": "recent"},
+            {"ts": "5", "user": "U1", "text": "latest prior"},
+            {"ts": "6", "user": "U1", "text": "current"},
+        ]})
+
+        context = await adapter_with_session_store._fetch_semantic_thread_context("C123", "1", "6", "T_TEAM", 3)
+
+        client.conversations_replies.assert_awaited_once_with(
+            channel="C123", ts="1", latest="6", inclusive=False, limit=4
+        )
+        assert [message.text for message in context] == ["duplicate first", "recent", "latest prior"]
+
+    @pytest.mark.asyncio
+    async def test_semantic_thread_context_api_failure_is_empty(self, adapter_with_session_store):
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(side_effect=RuntimeError("nope"))
+        assert await adapter_with_session_store._fetch_semantic_thread_context("C123", "1", "2", "T_TEAM", 8) == ()
+
+    @pytest.mark.asyncio
+    async def test_semantic_thread_context_api_failure_is_empty_and_auditable(
+        self, adapter_with_session_store, caplog
+    ):
+        caplog.set_level(logging.WARNING)
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(
+            side_effect=RuntimeError("slack transport down")
+        )
+
+        assert await adapter_with_session_store._fetch_semantic_thread_context(
+            "C123", "1", "2", "T_TEAM", 8
+        ) == ()
+        assert "semantic thread context fetch failed" in caplog.text
+        assert "thread_ts=1" in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
+        assert "slack transport down" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_semantic_router_never_runs_for_root_style_thread_event(self, adapter_with_session_store):
+        adapter_with_session_store.config.extra["semantic_thread_routing"] = {"enabled": True, "mode": "enforce"}
+        adapter_with_session_store._mentioned_threads.add("123.000")
+        adapter_with_session_store._semantic_thread_router = AsyncMock()
+        event = {"text": "그럼 그걸로 가자", "user": "U_USER", "channel": "C123", "ts": "123.000", "thread_ts": "123.000", "channel_type": "channel", "team": "T_TEAM"}
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store._semantic_thread_router.assert_not_awaited()
+        adapter_with_session_store.handle_message.assert_not_awaited()
+
+    def test_semantic_router_has_bounded_llm_concurrency_guard(self, adapter):
+        assert isinstance(adapter._semantic_router_semaphore, asyncio.Semaphore)
+        assert adapter._semantic_router_semaphore._value == 4
+
+    @pytest.mark.asyncio
+    async def test_semantic_router_enforce_confident_response_routes(self, adapter_with_session_store, mock_session_store):
+        from agent.semantic_router import RoutingDecision
+        mock_session_store._entries = {"agent:main:slack:group:C123:123.000:U_USER": MagicMock()}
+        adapter_with_session_store.config.extra["semantic_thread_routing"] = {"enabled": True, "mode": "enforce"}
+        adapter_with_session_store._semantic_thread_router = AsyncMock(return_value=RoutingDecision("respond", .85, "followup"))
+        adapter_with_session_store._fetch_semantic_thread_context = AsyncMock(return_value=())
+        event = {"text": "그럼 그걸로 가자", "user": "U_USER", "channel": "C123", "ts": "123.456", "thread_ts": "123.000", "channel_type": "channel", "team": "T_TEAM"}
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store._semantic_thread_router.assert_awaited_once()
+        adapter_with_session_store.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_semantic_router_classifies_contextual_requests_before_replying(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        mock_session_store._entries = {
+            "agent:main:slack:group:C123:123.000:U_USER": MagicMock()
+        }
+        adapter_with_session_store.config.extra["semantic_thread_routing"] = {
+            "enabled": True,
+            "mode": "enforce",
+        }
+        adapter_with_session_store._semantic_thread_router = AsyncMock(
+            return_value=RoutingDecision("ignore", 0.99, "human-directed")
+        )
+        adapter_with_session_store._fetch_semantic_thread_context = AsyncMock(
+            return_value=()
+        )
+        event = {
+            "text": "카일님 의견 반영해서 다시 정리해줘",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store._semantic_thread_router.assert_awaited_once()
+        adapter_with_session_store.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_semantic_router_shadow_ignores_without_reply(self, adapter_with_session_store, mock_session_store, caplog):
+        caplog.set_level(logging.INFO)
+        from agent.semantic_router import RoutingDecision
+        mock_session_store._entries = {"agent:main:slack:group:C123:123.000:U_USER": MagicMock()}
+        adapter_with_session_store.config.extra["semantic_thread_routing"] = {"enabled": True, "mode": "shadow"}
+        adapter_with_session_store._semantic_thread_router = AsyncMock(return_value=RoutingDecision("ignore", .9, "human chat"))
+        adapter_with_session_store._fetch_semantic_thread_context = AsyncMock(return_value=())
+        event = {"text": "그럼 그걸로 가자", "user": "U_USER", "channel": "C123", "ts": "123.456", "thread_ts": "123.000", "channel_type": "channel", "team": "T_TEAM"}
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store.handle_message.assert_not_awaited()
+        assert "semantic thread route" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_semantic_router_only_bypasses_explicit_addressing_and_top_level_gates(self, adapter_with_session_store, mock_session_store):
+        adapter_with_session_store.config.extra.update({"wake_words": ["모닥아"], "semantic_thread_routing": {"enabled": True, "mode": "enforce"}})
+        adapter_with_session_store._semantic_thread_router = AsyncMock(
+            return_value=RoutingDecision("ignore", 0.99, "not bot-directed")
+        )
+        adapter_with_session_store._fetch_semantic_thread_context = AsyncMock(return_value=())
+        mock_session_store._entries = {"agent:main:slack:group:C123:123.000:U_USER": MagicMock()}
+        events = [
+            {"text": "<@U_BOT> hello", "user": "U_USER", "channel": "C123", "ts": "1", "channel_type": "channel", "team": "T_TEAM"},
+            {"text": "모닥아 hello", "user": "U_USER", "channel": "C123", "ts": "2", "channel_type": "channel", "team": "T_TEAM"},
+            {"text": "top level", "user": "U_USER", "channel": "C123", "ts": "3", "channel_type": "channel", "team": "T_TEAM"},
+            {"text": "모닥이에게 시켜볼까요?", "user": "U_USER", "channel": "C123", "ts": "4", "thread_ts": "123.000", "channel_type": "channel", "team": "T_TEAM"},
+            {"text": "카일님 의견은?", "user": "U_USER", "channel": "C123", "ts": "5", "thread_ts": "123.000", "channel_type": "channel", "team": "T_TEAM"},
+        ]
+        for event in events:
+            await adapter_with_session_store._handle_slack_message(event)
+        assert adapter_with_session_store._semantic_thread_router.await_count == 2
+        assert adapter_with_session_store.handle_message.await_count == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("decision", [
+        RoutingDecision("respond", .84, "low"), RoutingDecision("ignore", 1, "ignore"), RoutingDecision("uncertain", 1, "uncertain"), None, asyncio.TimeoutError(),
+    ])
+    async def test_semantic_router_enforce_nonqualifying_results_are_silent(self, adapter_with_session_store, mock_session_store, decision):
+        mock_session_store._entries = {"agent:main:slack:group:C123:123.000:U_USER": MagicMock()}
+        adapter_with_session_store.config.extra["semantic_thread_routing"] = {"enabled": True, "mode": "enforce"}
+        adapter_with_session_store._semantic_thread_router = AsyncMock(side_effect=decision) if isinstance(decision, Exception) else AsyncMock(return_value=decision)
+        adapter_with_session_store._fetch_semantic_thread_context = AsyncMock(return_value=())
+        event = {"text": "그럼 그걸로 가자", "user": "U_USER", "channel": "C123", "ts": "123.456", "thread_ts": "123.000", "channel_type": "channel", "team": "T_TEAM"}
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_semantic_router_logs_exception_type_latency_and_preserves_enforce_silence(
+        self, adapter_with_session_store, mock_session_store, caplog
+    ):
+        """A router fault must be auditable without allowing an unclassified reply."""
+        caplog.set_level(logging.INFO)
+        mock_session_store._entries = {
+            "agent:main:slack:group:C123:123.000:U_USER": MagicMock()
+        }
+        adapter_with_session_store.config.extra["semantic_thread_routing"] = {
+            "enabled": True,
+            "mode": "enforce",
+            "timeout_seconds": 0.1,
+        }
+        adapter_with_session_store._semantic_thread_router = AsyncMock(
+            side_effect=ConnectionError("classifier transport unavailable")
+        )
+        adapter_with_session_store._fetch_semantic_thread_context = AsyncMock(return_value=())
+        event = {
+            "text": "그럼 그걸로 가자",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_awaited()
+        assert "semantic thread router failed" in caplog.text
+        assert "thread_ts=123.000" in caplog.text
+        assert "error_type=ConnectionError" in caplog.text
+        assert "classifier transport unavailable" in caplog.text
+        assert "latency_ms=" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_semantic_router_timeout_includes_semaphore_queue_in_failure_budget(
+        self, adapter_with_session_store, mock_session_store, caplog
+    ):
+        """Congestion must time out visibly instead of holding a Slack event forever."""
+        caplog.set_level(logging.INFO)
+        mock_session_store._entries = {
+            "agent:main:slack:group:C123:123.000:U_USER": MagicMock()
+        }
+        adapter_with_session_store.config.extra["semantic_thread_routing"] = {
+            "enabled": True,
+            "mode": "enforce",
+            "timeout_seconds": 0.1,
+        }
+        for _ in range(4):
+            await adapter_with_session_store._semantic_router_semaphore.acquire()
+        adapter_with_session_store._fetch_semantic_thread_context = AsyncMock(return_value=())
+        adapter_with_session_store._semantic_thread_router = AsyncMock()
+        event = {
+            "text": "그럼 그걸로 가자",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        try:
+            await adapter_with_session_store._handle_slack_message(event)
+        finally:
+            for _ in range(4):
+                adapter_with_session_store._semantic_router_semaphore.release()
+
+        adapter_with_session_store.handle_message.assert_not_awaited()
+        assert "semantic thread router failed" in caplog.text
+        assert "error_type=TimeoutError" in caplog.text
+        assert "latency_ms=" in caplog.text
 
     @pytest.mark.asyncio
     async def test_thread_reply_with_mention_strips_bot_id(
