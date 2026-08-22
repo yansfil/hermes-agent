@@ -20,13 +20,22 @@ class RecordingClient:
         self.release = asyncio.Event()
         self.entered = asyncio.Event()
         self.block_next_set = False
+        self.block_next_clear = False
 
     async def assistant_threads_setStatus(self, channel_id, thread_ts, status):
         if status and self.block_next_set:
             self.block_next_set = False
             self.entered.set()
             await self.release.wait()
+        if not status and self.block_next_clear:
+            self.block_next_clear = False
+            self.entered.set()
+            await self.release.wait()
         self.calls.append((thread_ts, status))
+
+    async def chat_postMessage(self, **kwargs):
+        self.calls.append((kwargs.get("thread_ts"), "post"))
+        return {"ts": "999.000"}
 
 
 def make_adapter(client):
@@ -58,6 +67,53 @@ async def test_clear_lands_after_in_flight_set():
     await stop_task
 
     assert [s for _, s in client.calls] == ["is thinking...", ""]
+
+
+@pytest.mark.asyncio
+async def test_set_queued_behind_in_flight_clear_is_dropped():
+    """A send_typing that starts while stop_typing is mid-clear re-registers
+    its entry, but the clear pops it inside the lock, so the queued set must
+    drop itself instead of landing after the clear."""
+    client = RecordingClient()
+    adapter = make_adapter(client)
+
+    # A tracked status exists, then the clear starts and blocks mid-API-call.
+    await adapter.send_typing("C123", dict(META))
+    client.block_next_clear = True
+    stop_task = asyncio.create_task(adapter.stop_typing("C123", dict(META)))
+    await client.entered.wait()
+
+    # A refresh tick arrives while the clear is in flight.
+    set_task = asyncio.create_task(adapter.send_typing("C123", dict(META)))
+    await asyncio.sleep(0.01)
+
+    client.release.set()
+    await stop_task
+    await set_task
+
+    statuses = [s for _, s in client.calls]
+    assert statuses == ["is thinking...", ""]  # no set after the final clear
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_clears_status_and_drops_late_set():
+    """The approval prompt must leave the composer usable: it clears the
+    tracked status client-side so a delayed set cannot resurrect it."""
+    client = RecordingClient()
+    adapter = make_adapter(client)
+
+    await adapter.send_typing("C123", dict(META))
+    result = await adapter.send_exec_approval(
+        "C123",
+        command="rm -rf /tmp/x",
+        session_key="s1",
+        metadata=dict(META),
+    )
+
+    assert result.success
+    key = ("T1", "C123", "100.000")
+    assert key not in adapter._active_status_threads
+    assert client.calls[-1] == ("100.000", "")  # explicit client-side clear
 
 
 @pytest.mark.asyncio

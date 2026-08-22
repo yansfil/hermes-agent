@@ -3524,10 +3524,14 @@ class SlackAdapter(BasePlatformAdapter):
         lock = self._status_thread_locks.get(key)
         if lock is None:
             if len(self._status_thread_locks) > self._ACTIVE_STATUS_THREADS_MAX:
+                # Never evict a lock for a thread that still tracks a status:
+                # a waiter in the release-to-wake handoff window reads as
+                # unlocked, but its thread is still registered, so this
+                # filter keeps the handoff race out of the sweep.
                 for old_key in [
                     k
                     for k, v in self._status_thread_locks.items()
-                    if not v.locked()
+                    if not v.locked() and k not in self._active_status_threads
                 ][: self._ACTIVE_STATUS_THREADS_MAX // 2]:
                     self._status_thread_locks.pop(old_key, None)
             lock = self._status_thread_locks[key] = asyncio.Lock()
@@ -3548,14 +3552,20 @@ class SlackAdapter(BasePlatformAdapter):
             )
         requested_team_id = self._metadata_team_id(metadata)
         active = None
+        resolved_key = None
         ambiguous_tracked = False
+        # Resolution only PEEKS at the tracked entry; the pop happens inside
+        # the per-thread lock below. Popping here would let a send_typing that
+        # re-registered its entry while this clear was mid-flight pass its
+        # in-lock re-check and resurrect the status right after the clear.
         if requested_thread_ts:
             if requested_team_id:
                 active_key = self._workspace_thread_key(
                     requested_team_id, chat_id, requested_thread_ts
                 )
-                if active_key:
-                    active = self._active_status_threads.pop(active_key, None)
+                if active_key and active_key in self._active_status_threads:
+                    resolved_key = active_key
+                    active = self._active_status_threads.get(active_key)
             else:
                 # Do not trust the mutable channel-only workspace fallback for
                 # a thread-specific cleanup: Slack Connect workspaces can share
@@ -3567,7 +3577,8 @@ class SlackAdapter(BasePlatformAdapter):
                     if key[1] == str(chat_id) and key[2] == requested_thread_ts
                 ]
                 if len(matching_keys) == 1:
-                    active = self._active_status_threads.pop(matching_keys[0], None)
+                    resolved_key = matching_keys[0]
+                    active = self._active_status_threads.get(matching_keys[0])
                 ambiguous_tracked = len(matching_keys) > 1
         else:
             # Metadata-free cleanup is safe only if exactly one status exists
@@ -3579,7 +3590,8 @@ class SlackAdapter(BasePlatformAdapter):
                 if key[1] == str(chat_id)
             ]
             if len(matching_keys) == 1:
-                active = self._active_status_threads.pop(matching_keys[0], None)
+                resolved_key = matching_keys[0]
+                active = self._active_status_threads.get(matching_keys[0])
         if isinstance(active, str):
             thread_ts = active
             team_id = ""
@@ -3607,8 +3619,11 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             # send_typing may already be in a slow Assistant API call.
             # Serialize the clear behind it so the final clear is always the
-            # last status write Slack observes (the tracked entry is popped
-            # above, so a queued send_typing skips its write).
+            # last status write Slack observes. The tracked entry is popped
+            # INSIDE the lock: any send_typing queued behind this clear then
+            # fails its in-lock re-check and skips its write instead of
+            # resurrecting the status (a genuinely new turn re-sets it on the
+            # next typing refresh tick).
             if lock_key:
                 async with self._status_thread_lock(lock_key):
                     await self._get_client(
@@ -3618,6 +3633,13 @@ class SlackAdapter(BasePlatformAdapter):
                         thread_ts=thread_ts,
                         status="",
                     )
+                    # Pop LAST in the critical section: a send_typing that
+                    # re-registered its entry while this clear was mid-flight
+                    # must find the entry gone when it acquires the lock, so
+                    # its re-check drops the stale set. Popped only on a
+                    # successful clear so a failed clear stays retryable.
+                    if resolved_key:
+                        self._active_status_threads.pop(resolved_key, None)
             else:
                 await self._get_client(
                     chat_id, team_id=team_id
@@ -3626,6 +3648,8 @@ class SlackAdapter(BasePlatformAdapter):
                     thread_ts=thread_ts,
                     status="",
                 )
+                if resolved_key:
+                    self._active_status_threads.pop(resolved_key, None)
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
 
@@ -7217,6 +7241,17 @@ class SlackAdapter(BasePlatformAdapter):
                 ] = False
                 self._trim_oldest_dict_entries(
                     self._approval_resolved, self._APPROVAL_RESOLVED_MAX
+                )
+
+            if msg_ts and thread_ts:
+                # The threaded approval post auto-clears the assistant status
+                # on Slack's side, but that server-side clear has no lock
+                # participant: a send_typing already in flight would land
+                # after it and re-disable the composer exactly while the user
+                # needs to type /approve. Run the client-side clear so the
+                # delayed set serializes behind it and drops itself.
+                await self._clear_thread_status_quietly(
+                    chat_id, {**(metadata or {}), "thread_id": thread_ts}
                 )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
