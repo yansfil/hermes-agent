@@ -68,6 +68,8 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
+    # Read-only Slack public-channel history (gated on Slack bot token)
+    "slack_history",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
@@ -330,6 +332,12 @@ TOOLSETS = {
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
         ],
+        "includes": [],
+    },
+
+    "slack": {
+        "description": "Read-only Slack public-channel history (list channels, read messages and threads). Excludes DMs and private channels.",
+        "tools": ["slack_history"],
         "includes": [],
     },
 
