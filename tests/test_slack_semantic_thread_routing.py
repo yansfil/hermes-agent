@@ -291,6 +291,42 @@ def test_mention_bypasses_semantic_gate():
     assert calls == []
 
 
+MENTION_GATED = {
+    "allowed_channels": ["C123"],
+    "reply_in_thread": True,
+}
+
+
+def test_thread_root_shaped_event_in_mentioned_thread_is_gated():
+    """A thread_ts == ts payload (e.g. an edit of a never-processed root)
+    waking via _mentioned_threads must pass intent gating, not bypass it."""
+    adapter = make_adapter(dict(MENTION_GATED))
+    handled = capture_handled(adapter)
+    adapter._mentioned_threads.add("100.000")
+
+    run(
+        adapter._handle_slack_message(
+            slack_event("점심 뭐 먹을까", ts="100.000", thread_ts="100.000")
+        )
+    )
+
+    assert handled == []
+
+
+def test_thread_root_shaped_event_with_direct_address_processes():
+    adapter = make_adapter(dict(MENTION_GATED))
+    handled = capture_handled(adapter)
+    adapter._mentioned_threads.add("100.000")
+
+    run(
+        adapter._handle_slack_message(
+            slack_event("모닥아 방금 내용 정리해줘", ts="100.000", thread_ts="100.000")
+        )
+    )
+
+    assert len(handled) == 1
+
+
 # --- deterministic route and normalizer ------------------------------------
 
 

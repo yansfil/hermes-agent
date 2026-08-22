@@ -1072,6 +1072,11 @@ class SlackAdapter(BasePlatformAdapter):
         # eviction (key[2] is the thread ts).
         self._active_status_threads: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._ACTIVE_STATUS_THREADS_MAX = 1000
+        # Serialize Slack Assistant API status writes per workspace thread.
+        # A delayed "is thinking" request must never land after a completion
+        # or approval-window clear: the pause flag alone cannot reach a
+        # send_typing call that is already awaiting the Slack API.
+        self._status_thread_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
         # Native progress streams share Slack's workspace/thread isolation.
         # Each stream owns a lock so concurrent start/append/stop calls cannot
         # race into duplicate streams or append after finalization.
@@ -3486,15 +3491,47 @@ class SlackAdapter(BasePlatformAdapter):
                     _status = f"still working… ({_human})"
                 else:
                     _status = "is thinking..."
-            await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
-                channel_id=chat_id,
-                thread_ts=thread_ts,
-                status=_status,
-            )
+            if status_key:
+                async with self._status_thread_lock(status_key):
+                    # A completion can clear the thread while this refresh
+                    # waits for its turn. Do not resurrect its status
+                    # afterward — the final clear must be the last status
+                    # write Slack observes.
+                    if status_key not in self._active_status_threads:
+                        return
+                    await self._get_client(
+                        chat_id, team_id=team_id
+                    ).assistant_threads_setStatus(
+                        channel_id=chat_id,
+                        thread_ts=thread_ts,
+                        status=_status,
+                    )
+            else:
+                await self._get_client(
+                    chat_id, team_id=team_id
+                ).assistant_threads_setStatus(
+                    channel_id=chat_id,
+                    thread_ts=thread_ts,
+                    status=_status,
+                )
         except Exception as e:
             # Silently ignore — may lack assistant:write scope or not be
             # in an assistant-enabled context. Falls back to reactions.
             logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
+
+    def _status_thread_lock(self, key: Tuple[str, str, str]) -> asyncio.Lock:
+        """Return the lock that orders Assistant API writes for one thread."""
+        lock = self._status_thread_locks.get(key)
+        if lock is None:
+            if len(self._status_thread_locks) > self._ACTIVE_STATUS_THREADS_MAX:
+                for old_key in [
+                    k
+                    for k, v in self._status_thread_locks.items()
+                    if not v.locked()
+                ][: self._ACTIVE_STATUS_THREADS_MAX // 2]:
+                    self._status_thread_locks.pop(old_key, None)
+            lock = self._status_thread_locks[key] = asyncio.Lock()
+        return lock
 
     async def stop_typing(self, chat_id: str, metadata=None) -> None:
         """Clear the assistant thread status indicator."""
@@ -3566,12 +3603,29 @@ class SlackAdapter(BasePlatformAdapter):
             team_id = requested_team_id or team_id
         if not thread_ts:
             return
+        lock_key = self._workspace_thread_key(team_id, chat_id, str(thread_ts))
         try:
-            await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
-                channel_id=chat_id,
-                thread_ts=thread_ts,
-                status="",
-            )
+            # send_typing may already be in a slow Assistant API call.
+            # Serialize the clear behind it so the final clear is always the
+            # last status write Slack observes (the tracked entry is popped
+            # above, so a queued send_typing skips its write).
+            if lock_key:
+                async with self._status_thread_lock(lock_key):
+                    await self._get_client(
+                        chat_id, team_id=team_id
+                    ).assistant_threads_setStatus(
+                        channel_id=chat_id,
+                        thread_ts=thread_ts,
+                        status="",
+                    )
+            else:
+                await self._get_client(
+                    chat_id, team_id=team_id
+                ).assistant_threads_setStatus(
+                    channel_id=chat_id,
+                    thread_ts=thread_ts,
+                    status="",
+                )
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
 
@@ -6334,8 +6388,12 @@ class SlackAdapter(BasePlatformAdapter):
                 # answer-everything participant. Gate unmentioned thread
                 # replies through ignore prefixes, a conservative
                 # deterministic route, and (when enabled) the semantic
-                # classifier before dispatching.
-                if is_thread_reply:
+                # classifier before dispatching. Keyed on event_thread_ts,
+                # not is_thread_reply: a thread-root-shaped payload
+                # (thread_ts == ts, e.g. an edit of a never-processed root)
+                # can wake via _mentioned_threads and must not bypass the
+                # gate.
+                if event_thread_ts:
                     if self._slack_has_ignore_prefix(routing_text):
                         return
                     semantic = self._slack_semantic_thread_routing()
