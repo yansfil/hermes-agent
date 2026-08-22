@@ -43,3 +43,23 @@ optional_env:
       top-level free response channels
     prompt: "Require mentions in Slack threads? (true/false)"
     password: false
+  - name: SLACK_ARCHIVE_DUCKDB_PATH
+    description: >-
+      DuckDB file path for archiving public-channel messages. Unset disables
+      archiving; when set, every public-channel message event is recorded
+      (idempotently) before mention gating, so tools can resolve message ts
+      values to channels and permalinks later.
+    prompt: "Slack archive DuckDB path (empty to disable)"
+    password: false
+  - name: SLACK_IGNORE_PREFIXES
+    description: >-
+      Comma-separated message prefixes that keep the bot silent in
+      participated threads (default: "xx,//,모닥무시,ignore:,무시:")
+    prompt: "Thread ignore prefixes (comma-separated)"
+    password: false
+  - name: SLACK_SMART_THREAD_REPLIES
+    description: >-
+      Apply conservative intent gating to unmentioned replies in threads the
+      bot participates in (default true; false answers every in-scope reply)
+    prompt: "Smart thread replies? (true/false)"
+    password: false

@@ -145,9 +145,16 @@ def test_yaml_bridge_sets_env(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_forced_channel_wake_checks_still_apply(adapter):
-    """A previously mentioned thread still auto-follows in a forced channel."""
+    """A previously mentioned thread still auto-follows in a forced channel.
+
+    smart_thread_replies is disabled here: with it on (the default), an
+    unmentioned in-scope reply additionally passes intent gating, which an
+    ambiguous "follow-up" would not (see
+    tests/test_slack_semantic_thread_routing.py).
+    """
     adapter.config.extra["require_mention"] = False
     adapter.config.extra["require_mention_channels"] = CHANNEL_ID
+    adapter.config.extra["smart_thread_replies"] = False
     adapter._mentioned_threads.add("100.000")
 
     await adapter._handle_slack_message(

@@ -2671,6 +2671,11 @@ class TestThreadReplyHandling:
         self, adapter_with_session_store, mock_session_store
     ):
         """Thread replies without mention should be processed if there's an active session."""
+        # Intent gating off: this test verifies the session wake check, not
+        # the fork's smart-thread-replies gate (which would silence the
+        # ambiguous "Follow-up question" — covered in
+        # tests/test_slack_semantic_thread_routing.py).
+        adapter_with_session_store.config.extra["smart_thread_replies"] = False
         # Simulate an active session for this thread
         session_key = "agent:main:slack:group:T_TEAM:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
@@ -2699,6 +2704,11 @@ class TestThreadReplyHandling:
         the bot (#24848) — e.g. parent says '<@bot> check this and ask me
         before running', a later bare 'run' reply must wake the bot even
         with no session and no in-memory mention tracking (restart-safe)."""
+        # Intent gating off: this test verifies the parent-mention wake
+        # check; the fork's smart-thread-replies gate would silence the
+        # ambiguous bare reply (covered in
+        # tests/test_slack_semantic_thread_routing.py).
+        adapter_with_session_store.config.extra["smart_thread_replies"] = False
         mock_session_store._entries = {}
         adapter_with_session_store._has_active_session_for_thread = MagicMock(
             return_value=False
